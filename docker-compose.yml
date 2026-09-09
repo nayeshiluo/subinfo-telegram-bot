@@ -1,0 +1,10 @@
+services:
+  subinfo-bot:
+    build: .
+    container_name: subinfo-telegram-bot
+    restart: always
+    environment:
+      - SUBINFO_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+      - SUBINFO_ADMIN_IDS=YOUR_TELEGRAM_ID
+    volumes:
+      - ./data:/home/ubuntu/subinfo-bot

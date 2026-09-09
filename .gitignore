@@ -1,0 +1,13 @@
+# 虚拟环境与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# 运行时数据库与临时产物
+subs.db
+subs.db-journal
+*.log
+*.tmp
+clean_nodes.txt
