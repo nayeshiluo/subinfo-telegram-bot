@@ -19,6 +19,9 @@ import base64
 import sqlite3
 import logging
 import signal
+import socket
+import ipaddress
+from urllib.parse import urljoin, urlsplit
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -205,21 +208,71 @@ def country_stats(nodes: list[dict]) -> list[tuple[str, int]]:
     return sorted(counter.items(), key=lambda x: -x[1])
 
 # ---------- 网络请求 ----------
+MAX_REDIRECTS = 5
+ALLOWED_URL_SCHEMES = {"http", "https"}
+ALLOWED_URL_PORTS = {80, 443}
+
+def _validate_public_url(url: str) -> None:
+    """Reject SSRF targets before every outbound request, including redirects."""
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() not in ALLOWED_URL_SCHEMES:
+        raise ValueError("仅允许 http/https 订阅链接")
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("订阅链接格式无效")
+    try:
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("订阅链接端口无效") from exc
+    if port not in ALLOWED_URL_PORTS:
+        raise ValueError("订阅链接仅允许 80/443 端口")
+
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)}
+    except socket.gaierror as exc:
+        raise ValueError("订阅域名无法解析") from exc
+    if not addresses:
+        raise ValueError("订阅域名无法解析")
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("禁止访问本机、内网、链路本地或保留地址")
+
 def fetch_sub(url: str) -> dict:
     result = {"ok": False, "error": "", "url": url, "body": b"", "final_headers": {}}
+    headers = {"User-Agent": CLASH_UAS[0], "Accept": "*/*"}
+    current_url = url
     try:
-        headers = {"User-Agent": CLASH_UAS[0], "Accept": "*/*"}
-        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=True)
-        content = b""
-        for chunk in resp.iter_content(65536):
-            content += chunk
-            if len(content) > MAX_SUB_SIZE:
-                break
-        result["status"] = resp.status_code
-        result["final_url"] = resp.url
-        result["final_headers"] = dict(resp.headers)
-        result["body"] = content
-        result["ok"] = True
+        for redirect_count in range(MAX_REDIRECTS + 1):
+            _validate_public_url(current_url)
+            resp = session.get(
+                current_url, headers=headers, timeout=REQUEST_TIMEOUT,
+                allow_redirects=False, stream=True
+            )
+            if resp.is_redirect or resp.is_permanent_redirect:
+                location = resp.headers.get("Location")
+                resp.close()
+                if not location:
+                    raise ValueError("重定向响应缺少 Location")
+                if redirect_count >= MAX_REDIRECTS:
+                    raise ValueError("订阅链接重定向次数过多")
+                current_url = urljoin(current_url, location)
+                continue
+
+            content = bytearray()
+            for chunk in resp.iter_content(65536):
+                if not chunk:
+                    continue
+                if len(content) + len(chunk) > MAX_SUB_SIZE:
+                    resp.close()
+                    raise ValueError("订阅内容超过 5MB 安全上限")
+                content.extend(chunk)
+            result["status"] = resp.status_code
+            result["final_url"] = current_url
+            result["final_headers"] = dict(resp.headers)
+            result["body"] = bytes(content)
+            result["ok"] = True
+            resp.close()
+            return result
     except Exception as e:
         result["error"] = str(e)
     return result
